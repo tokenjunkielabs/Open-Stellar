@@ -6,6 +6,13 @@ export interface TaskOfferReward {
   asset: TaskOfferAsset
 }
 
+export interface TaskOfferTransition {
+  from: TaskOfferStatus
+  to: TaskOfferStatus
+  actorId: string
+  at: string
+}
+
 export interface TaskOffer {
   offerId: string
   postedBy: string
@@ -16,6 +23,14 @@ export interface TaskOffer {
   status: TaskOfferStatus
   escrowTx: string
   refundTx?: string
+  workerAgentId?: string
+  result?: unknown
+  deliveredAt?: string
+  acceptedAt?: string
+  disputedAt?: string
+  releaseTx?: string
+  disputeTx?: string
+  transitionLog: TaskOfferTransition[]
   createdAt: string
   updatedAt: string
 }
@@ -43,6 +58,26 @@ const state: TaskOfferState = globalState.__openStellarTaskOffers__ ?? {
 }
 
 globalState.__openStellarTaskOffers__ ??= state
+
+const TASK_OFFER_TRANSITIONS: Record<TaskOfferStatus, readonly TaskOfferStatus[]> = {
+  open: ["claimed", "expired", "cancelled"],
+  claimed: ["delivered"],
+  delivered: ["accepted", "disputed"],
+  accepted: [],
+  disputed: [],
+  expired: [],
+  cancelled: [],
+}
+
+export class TaskOfferStateError extends Error {
+  readonly currentStatus: TaskOfferStatus
+
+  constructor(message: string, currentStatus: TaskOfferStatus) {
+    super(message)
+    this.name = "TaskOfferStateError"
+    this.currentStatus = currentStatus
+  }
+}
 
 function assertNonEmpty(value: unknown, field: string): string {
   const text = typeof value === "string" ? value.trim() : ""
@@ -91,22 +126,51 @@ function normalizeDeadline(deadline: number): number {
   return timestamp
 }
 
-function escrowHash(prefix: "escrow" | "refund", offerId: string): string {
+export function taskOfferSettlementRef(prefix: "escrow" | "refund" | "release" | "dispute", offerId: string): string {
   return `${prefix}_${offerId}_${crypto.randomUUID()}`
+}
+
+function transitionAllowed(from: TaskOfferStatus, to: TaskOfferStatus): boolean {
+  return TASK_OFFER_TRANSITIONS[from].includes(to)
+}
+
+export function transitionTaskOffer(
+  offerId: string,
+  to: TaskOfferStatus,
+  actorId: string,
+  patch: Partial<Omit<TaskOffer, "offerId" | "status" | "updatedAt" | "transitionLog">> = {},
+): TaskOffer {
+  const current = getTaskOffer(offerId)
+  if (!current) throw new Error("Task offer not found")
+  if (!transitionAllowed(current.status, to)) {
+    throw new TaskOfferStateError(
+      `Cannot transition task offer from ${current.status} to ${to}`,
+      current.status,
+    )
+  }
+
+  const now = new Date().toISOString()
+  const next: TaskOffer = {
+    ...current,
+    ...patch,
+    status: to,
+    updatedAt: now,
+    transitionLog: [
+      ...current.transitionLog,
+      { from: current.status, to, actorId, at: now },
+    ],
+  }
+  state.offers.set(offerId, next)
+  return next
 }
 
 function refreshOfferExpiry(offer: TaskOffer): TaskOffer {
   if (offer.status !== "open" || offer.deadline > Math.floor(Date.now() / 1000)) {
     return offer
   }
-  const expired = {
-    ...offer,
-    status: "expired" as const,
-    refundTx: offer.refundTx ?? escrowHash("refund", offer.offerId),
-    updatedAt: new Date().toISOString(),
-  }
-  state.offers.set(offer.offerId, expired)
-  return expired
+  return transitionTaskOffer(offer.offerId, "expired", "system:expiry", {
+    refundTx: offer.refundTx ?? taskOfferSettlementRef("refund", offer.offerId),
+  })
 }
 
 export function resetTaskOffersForTests(): void {
@@ -125,7 +189,8 @@ export function createTaskOffer(input: CreateTaskOfferInput): TaskOffer {
     reward: normalizeReward(input.reward),
     deadline: normalizeDeadline(input.deadline),
     status: "open",
-    escrowTx: escrowHash("escrow", offerId),
+    escrowTx: taskOfferSettlementRef("escrow", offerId),
+    transitionLog: [],
     createdAt: now,
     updatedAt: now,
   }
@@ -150,13 +215,11 @@ export function cancelTaskOffer(offerId: string, actorId: string): TaskOffer {
   const offer = getTaskOffer(offerId)
   if (!offer) throw new Error("Task offer not found")
   if (offer.postedBy !== actorId) throw new Error("Only the poster can cancel this offer")
-  if (offer.status !== "open") throw new Error("Only open offers can be cancelled")
-  const cancelled = {
-    ...offer,
-    status: "cancelled" as const,
-    refundTx: offer.refundTx ?? escrowHash("refund", offer.offerId),
-    updatedAt: new Date().toISOString(),
+  if (offer.status !== "open") {
+    throw new TaskOfferStateError("Only open offers can be cancelled", offer.status)
   }
-  state.offers.set(offerId, cancelled)
-  return cancelled
+
+  return transitionTaskOffer(offerId, "cancelled", actorId, {
+    refundTx: offer.refundTx ?? taskOfferSettlementRef("refund", offer.offerId),
+  })
 }
