@@ -140,7 +140,7 @@ export function transitionTaskOffer(
   actorId: string,
   patch: Partial<Omit<TaskOffer, "offerId" | "status" | "updatedAt" | "transitionLog">> = {},
 ): TaskOffer {
-  const current = getTaskOffer(offerId)
+  const current = state.offers.get(offerId) ?? null
   if (!current) throw new Error("Task offer not found")
   if (!transitionAllowed(current.status, to)) {
     throw new TaskOfferStateError(
